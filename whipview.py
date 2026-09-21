@@ -7,7 +7,9 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
+import webbrowser
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,7 +65,7 @@ def iso_time(timestamp: float) -> str:
 def prompt_files() -> list[tuple[str, str, Path]]:
     found: list[tuple[str, str, Path]] = []
     try:
-        paths = TASK_DIR.iterdir()
+        paths = list(TASK_DIR.iterdir())  # iterdir is lazy: list() surfaces a missing dir here
     except OSError:
         return found
     for path in paths:
@@ -264,12 +266,17 @@ def main() -> None:
     ap.add_argument("repo", nargs="?", default=".", help="project root (default: cwd)")
     ap.add_argument("--tasks-dir", help="task folder (default: <repo>/.codex-tasks)")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
     args = ap.parse_args()
     REPO_ROOT = Path(args.repo).resolve()
     TASK_DIR = Path(args.tasks_dir).resolve() if args.tasks_dir else REPO_ROOT / ".codex-tasks"
     PORT = args.port
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
-    print(f"http://{HOST}:{PORT}", flush=True)
+    url = f"http://{HOST}:{PORT}"
+    print(f"Whip-View watching {TASK_DIR}", flush=True)
+    print(f"{url}   (Ctrl+C to stop)", flush=True)
+    if not args.no_browser:
+        threading.Timer(0.5, webbrowser.open, args=(url,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

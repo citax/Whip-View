@@ -1,0 +1,3 @@
+# Whip-View has no third-party dependencies.
+# Requires Python 3.9+ (standard library only: http.server, json, argparse, webbrowser).
+# Optional: git on PATH (for the "recent commits" panel).

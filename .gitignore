@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+# per-machine default project path
+whipview.local
+*.txt

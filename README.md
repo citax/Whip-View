@@ -3,14 +3,23 @@
 Tiny live dashboard for watching local [Codex CLI](https://github.com/openai/codex)
 task runs driven by an orchestrator (e.g. Claude Code). Python stdlib only.
 
+## Requirements
+
+Python 3.9+ — standard library only, nothing to install (see `requirements.txt`).
+Optional: `git` on PATH for the recent-commits panel.
+
 ## Run
 
-```bash
-python whipview.py <project-root>            # watches <project-root>/.codex-tasks
-python whipview.py . --tasks-dir path/to/tasks --port 8765
-```
+**Windows:** double-click `whipview.cmd`, or `whipview.cmd <project-root>`.
+**Linux / macOS / Git Bash:** `./whipview.sh <project-root>`
 
-Open http://127.0.0.1:8765
+The browser opens at http://127.0.0.1:8765 automatically.
+
+Default project: put its path on the first line of `whipview.local` (git-ignored,
+per machine) so a plain double-click watches it. Otherwise the current folder is used.
+
+Options: `--port N`, `--tasks-dir path/to/tasks`, `--no-browser`.
+Direct: `python whipview.py <project-root> [options]`.
 
 ## Task folder convention
 
