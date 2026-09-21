@@ -35,3 +35,20 @@ Status per task: `done` (report exists) · `running` (log updated < 10 min ago) 
 
 The page shows the orchestrator's current step, all tasks with model / effort /
 tokens / elapsed, a live log tail per task, and the last git commits.
+
+## Plan usage
+
+The Usage card shows Claude and Codex plan consumption for the 5-hour and weekly
+windows, reset countdowns, and freshness. It refreshes every 10 seconds. Codex
+usage is read from the newest local session rollout; Claude usage is supplied by
+the included statusline helper.
+
+Enable it by adding this to `~/.claude/settings.json` (replace `<path>` with this
+repository's absolute path):
+
+```json
+"statusLine": {"type": "command", "command": "python <path>/claude_statusline.py"}
+```
+
+The dashboard only reads these files. Override their locations with
+`WHIPVIEW_CODEX_HOME` and `WHIPVIEW_CLAUDE_USAGE` if needed.
