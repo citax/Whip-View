@@ -386,15 +386,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return
 
 
+def _local_project() -> str | None:
+    """First line of whipview.local next to this script, if it names a folder.
+
+    Lets a double-clicked whipview.py (no arguments, cwd = this folder) watch
+    the configured project, like the launcher scripts do.
+    """
+    try:
+        lines = (Path(__file__).resolve().parent / "whipview.local").read_text(
+            encoding="utf-8-sig").splitlines()
+    except OSError:
+        return None
+    first = lines[0].strip().strip('"') if lines else ""
+    return first if first and Path(first).is_dir() else None
+
+
 def main() -> None:
     global REPO_ROOT, TASK_DIR, PORT
     ap = argparse.ArgumentParser(description="Live dashboard for Codex task runs.")
-    ap.add_argument("repo", nargs="?", default=".", help="project root (default: cwd)")
+    ap.add_argument("repo", nargs="?", default=None,
+                    help="project root (default: first line of whipview.local, else cwd)")
     ap.add_argument("--tasks-dir", help="task folder (default: <repo>/.codex-tasks)")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--no-browser", action="store_true", help="do not open the browser")
     args = ap.parse_args()
-    REPO_ROOT = Path(args.repo).resolve()
+    REPO_ROOT = Path(args.repo or _local_project() or ".").resolve()
     TASK_DIR = Path(args.tasks_dir).resolve() if args.tasks_dir else REPO_ROOT / ".codex-tasks"
     PORT = args.port
     server = ThreadingHTTPServer((HOST, PORT), DashboardHandler)
