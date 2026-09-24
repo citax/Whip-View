@@ -34,8 +34,8 @@ Status per task: `done` (report exists) · `running` (log updated < 10 min ago) 
 `stalled` · `queued` (prompt only).
 
 The page shows the orchestrator's current step, the queued duties in run order,
-all tasks with model / effort / tokens / elapsed / start–end clock, a live log
-tail per task, and the last git commits. Run order is the `next` list in
+Claude and Grok sessions for this project, all Codex tasks with model / effort /
+tokens / elapsed / start–end clock, a live log tail per task, and the last git commits. Run order is the `next` list in
 `status.json` (the first entry runs first). Queued prompts missing from that
 list follow afterwards, oldest prompt first.
 The clock is the log file's creation time through the report's finish time
@@ -59,3 +59,17 @@ repository's absolute path):
 
 The dashboard only reads these files. Override their locations with
 `WHIPVIEW_CODEX_HOME` and `WHIPVIEW_CLAUDE_USAGE` if needed.
+
+## Other sessions
+
+Codex task runs come from `.codex-tasks`. The Oturumlar section adds sessions
+that other assistants held in this same project folder:
+
+| Assistant | Where it is read |
+|-----------|------------------|
+| Claude Code | `~/.claude/projects/<project>/*.jsonl` |
+| Grok | `~/.grok/sessions/*/*/summary.json` whose `cwd` is this project |
+
+A session updated in the last 10 minutes is `running`; otherwise it is `done`.
+Click a row for the prompts and the latest reply or recap. Override the roots
+with `WHIPVIEW_CLAUDE_HOME` and `WHIPVIEW_GROK_HOME`.

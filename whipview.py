@@ -259,6 +259,348 @@ def duty_queue(tasks: list[dict], upcoming: object) -> list[dict]:
     return ordered
 
 
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,80}$")
+_SESSION_CACHE: dict[tuple, dict | None] = {}
+_RUNNING_WINDOW = 600
+
+
+def same_dir(path_text: object, root: Path) -> bool:
+    if not isinstance(path_text, str) or not path_text.strip():
+        return False
+    try:
+        return os.path.normcase(str(Path(path_text).resolve())) == os.path.normcase(str(root.resolve()))
+    except OSError:
+        return False
+
+
+def parse_iso(value: object) -> float | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = re.sub(r"(\.\d{6})\d+", r"\1", value.strip().replace("Z", "+00:00"))
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def message_text(message: object) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+            parts.append(str(block["text"]).strip())
+    return "\n".join(part for part in parts if part).strip()
+
+
+def cached_scan(path: Path, build) -> dict | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    if key not in _SESSION_CACHE:
+        if len(_SESSION_CACHE) > 200:
+            _SESSION_CACHE.clear()
+        try:
+            _SESSION_CACHE[key] = build(path)
+        except OSError:
+            _SESSION_CACHE[key] = None
+    return _SESSION_CACHE[key]
+
+
+def session_row(source: str, session_id: str, facts: dict, path: Path, now: float) -> dict:
+    started = facts.get("started")
+    ended = facts.get("ended") or path.stat().st_mtime
+    running = now - path.stat().st_mtime < _RUNNING_WINDOW
+    start_time = started if isinstance(started, float) else file_birth(path)
+    end_time = now if running else ended if isinstance(ended, float) else path.stat().st_mtime
+    tokens = facts.get("tokens")
+    return {
+        "id": session_id,
+        "source": source,
+        "title": facts.get("title") or session_id,
+        "status": "running" if running else "done",
+        "model": facts.get("model") or "",
+        "effort": facts.get("effort") or "",
+        "tokens": tokens if isinstance(tokens, int) and tokens > 0 else None,
+        "clock": clock_span(start_time, None if running else end_time),
+        "_sort": end_time,
+    }
+
+
+def claude_home() -> Path:
+    configured = os.environ.get("WHIPVIEW_CLAUDE_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
+
+
+def grok_home() -> Path:
+    configured = os.environ.get("WHIPVIEW_GROK_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".grok"
+
+
+def scan_claude_session(path: Path) -> dict | None:
+    title = ""
+    prompt = ""
+    model = ""
+    effort = ""
+    tokens = 0
+    per_message: dict[str, int] = {}
+    started = None
+    ended = None
+    cwd_ok = False
+    saw_cwd = False
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if '"type"' not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            moment = parse_iso(event.get("timestamp"))
+            if moment is not None:
+                started = moment if started is None else min(started, moment)
+                ended = moment if ended is None else max(ended, moment)
+            cwd = event.get("cwd")
+            if isinstance(cwd, str):
+                saw_cwd = True
+                cwd_ok = cwd_ok or same_dir(cwd, REPO_ROOT)
+            if event.get("isSidechain"):
+                continue
+            kind = event.get("type")
+            if kind == "ai-title" and isinstance(event.get("aiTitle"), str):
+                title = event["aiTitle"].strip() or title
+            elif kind == "assistant":
+                message = event.get("message") if isinstance(event.get("message"), dict) else {}
+                if isinstance(message.get("model"), str):
+                    model = message["model"]
+                if isinstance(event.get("effort"), str):
+                    effort = event["effort"]
+                usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+                output = usage.get("output_tokens")
+                if isinstance(output, int) and output > 0:
+                    message_id = message.get("id")
+                    if isinstance(message_id, str):
+                        # One event per content block, same usage repeated.
+                        per_message[message_id] = output
+                    else:
+                        tokens += output
+                if not prompt:
+                    prompt = message_text(message)[:160]
+            elif kind == "user" and not prompt:
+                text = message_text(event.get("message"))
+                if text and not text.startswith("<"):
+                    prompt = text[:160]
+    if saw_cwd and not cwd_ok:
+        return None
+    if not title and not prompt:
+        return None
+    return {
+        "title": title or prompt,
+        "model": model,
+        "effort": effort,
+        "tokens": tokens + sum(per_message.values()),
+        "started": started,
+        "ended": ended,
+    }
+
+
+def claude_sessions(now: float) -> list[dict]:
+    folder = claude_home() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(REPO_ROOT.resolve()))
+    rows = []
+    try:
+        files = [path for path in folder.glob("*.jsonl") if path.is_file()]
+    except OSError:
+        return rows
+    for path in files:
+        facts = cached_scan(path, scan_claude_session)
+        if not facts:
+            continue
+        rows.append(session_row("Claude", path.stem, facts, path, now))
+    return rows
+
+
+def scan_grok_session(path: Path) -> dict | None:
+    try:
+        summary = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    info = summary.get("info") if isinstance(summary.get("info"), dict) else {}
+    cwd = info.get("cwd") or summary.get("git_root_dir")
+    if not same_dir(cwd, REPO_ROOT):
+        return None
+    title = summary.get("generated_title") or summary.get("session_summary") or summary.get("last_turn_summary") or ""
+    if not isinstance(title, str) or not title.strip():
+        return None
+    tokens = 0
+    usage_path = path.with_name("usage.json")
+    try:
+        usage = json.loads(usage_path.read_text(encoding="utf-8"))
+        session = usage.get("session") if isinstance(usage, dict) else None
+        if isinstance(session, dict):
+            for key in ("outputTokens", "reasoningTokens"):
+                value = session.get(key)
+                if isinstance(value, int) and value > 0:
+                    tokens += value
+    except (OSError, json.JSONDecodeError):
+        pass
+    model = summary.get("current_model_id") if isinstance(summary.get("current_model_id"), str) else ""
+    effort = summary.get("reasoning_effort") if isinstance(summary.get("reasoning_effort"), str) else ""
+    return {
+        "title": title.strip(),
+        "model": model.removesuffix("-internal"),
+        "effort": effort,
+        "tokens": tokens,
+        "started": parse_iso(summary.get("created_at")),
+        "ended": parse_iso(summary.get("last_active_at") or summary.get("updated_at")),
+    }
+
+
+def grok_sessions(now: float) -> list[dict]:
+    root = grok_home() / "sessions"
+    rows = []
+    try:
+        summaries = [path for path in root.glob("*/*/summary.json") if path.is_file()]
+    except OSError:
+        return rows
+    for path in summaries:
+        facts = cached_scan(path, scan_grok_session)
+        if not facts:
+            continue
+        session_id = path.parent.name
+        rows.append(session_row("Grok", session_id, facts, path, now))
+    return rows
+
+
+def session_state() -> list[dict]:
+    now = time.time()
+    rows = claude_sessions(now) + grok_sessions(now)
+    rows.sort(key=lambda row: row.pop("_sort"), reverse=True)
+    return rows[:40]
+
+
+def clip_text(text: str, limit: int = 12000) -> str:
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def claude_session_detail(session_id: str) -> dict | None:
+    path = claude_home() / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(REPO_ROOT.resolve())) / f"{session_id}.jsonl"
+    if not path.is_file():
+        return None
+    prompts: list[str] = []
+    answers: list[str] = []
+    lines: deque[str] = deque(maxlen=40)
+    cwd_ok = False
+    saw_cwd = False
+    try:
+        stream = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with stream:
+        for raw in stream:
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("isSidechain"):
+                continue
+            cwd = event.get("cwd")
+            if isinstance(cwd, str):
+                saw_cwd = True
+                cwd_ok = cwd_ok or same_dir(cwd, REPO_ROOT)
+            text = message_text(event.get("message"))
+            if not text:
+                continue
+            kind = event.get("type")
+            if kind == "user" and text.startswith("<"):
+                continue  # tool / task notifications injected by the harness
+            short = text if len(text) <= 2000 else text[:2000] + "…"
+            if kind == "user":
+                prompts.append(short)
+                lines.append("Kullanıcı: " + short)
+            elif kind == "assistant":
+                answers.append(short)
+                lines.append("Claude: " + short)
+    if saw_cwd and not cwd_ok:
+        return None
+    if not prompts and not answers:
+        return None
+    facts = cached_scan(path, scan_claude_session) or {}
+    return {
+        "id": session_id,
+        "source": "Claude",
+        "title": facts.get("title") or prompts[0][:120],
+        "prompt": clip_text("\n\n".join(prompts)),
+        "report": answers[-1] if answers else "",
+        "log": clip_text("\n\n".join(lines)),
+    }
+
+
+def grok_session_detail(session_id: str) -> dict | None:
+    root = grok_home() / "sessions"
+    try:
+        summaries = [path for path in root.glob(f"*/{session_id}/summary.json") if path.is_file()]
+    except OSError:
+        return None
+    for path in summaries:
+        facts = cached_scan(path, scan_grok_session)
+        if not facts:
+            continue
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            summary = {}
+        prompts = []
+        history = path.parent.parent / "prompt_history.jsonl"
+        try:
+            for raw in history.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    item = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict) and item.get("session_id") == session_id and isinstance(item.get("prompt"), str):
+                    prompts.append(item["prompt"].strip())
+        except OSError:
+            pass
+        report = ""
+        if isinstance(summary, dict):
+            report = summary.get("last_recap") or summary.get("last_turn_summary") or ""
+            if not isinstance(report, str):
+                report = ""
+        return {
+            "id": session_id,
+            "source": "Grok",
+            "title": facts.get("title") or session_id,
+            "prompt": clip_text("\n\n".join(prompts)),
+            "report": report.strip(),
+            "log": report.strip(),
+        }
+    return None
+
+
+def session_detail(source: str, session_id: str) -> dict | None:
+    if not SESSION_ID_RE.match(session_id):
+        return None
+    if source == "claude":
+        return claude_session_detail(session_id)
+    if source == "grok":
+        return grok_session_detail(session_id)
+    return None
+
+
 def log_tail(path: Path, count: int = 80) -> str:
     try:
         with path.open("r", encoding="utf-8", errors="replace") as stream:
@@ -387,13 +729,14 @@ main{max-width:1250px;margin:auto;padding:24px}h1,h2,h3{margin:.2em 0 .6em}h1{fo
 @media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#f7f8fa;--surface:#fff;--surface-2:#f1f3f6;--border:#dfe3e8;--text:#20242b;--muted:#697181;--accent:#526fd6}}
 *{box-sizing:border-box}html,body{min-width:0}body{background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:tabular-nums}main{max-width:1200px;padding:0 24px 32px}.topbar{height:64px;display:flex;align-items:center;gap:10px;margin-bottom:18px;border-bottom:1px solid var(--border)}.brand{font-size:16px;font-weight:680;letter-spacing:-.02em}.folder{color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.live-dot{width:7px;height:7px;border-radius:50%;background:var(--ok);margin-left:auto;box-shadow:0 0 0 0 color-mix(in srgb,var(--ok) 35%,transparent);animation:live 2s infinite}.live-dot.offline{background:var(--bad);animation:none}@keyframes live{50%{box-shadow:0 0 0 5px transparent}}h2{font-size:13px;letter-spacing:.01em;margin:0 0 14px}.card{background:var(--surface);border-color:var(--border);border-radius:10px;padding:16px;margin-bottom:14px;box-shadow:none}.usage-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1px;background:var(--border);border:1px solid var(--border);border-radius:8px;overflow:hidden}.usage-cell{background:var(--surface);padding:13px}.usage-head{display:flex;justify-content:space-between;color:var(--muted);font-size:12px}.usage-pct{font:600 24px/1.25 ui-monospace,"Cascadia Code",Consolas,monospace;margin:5px 0 8px}.usage-track{height:6px;background:var(--surface-2)}.usage-fill{background:var(--ok)}.usage-fill.amber{background:var(--warn)}.usage-fill.red{background:var(--bad)}.usage-reset,.usage-message{color:var(--muted);font-size:11px;margin-top:7px}.usage-cell.stale .usage-fill{background:var(--muted)}.usage-cell.stale .usage-pct{color:var(--muted)}.orch-head{display:flex;justify-content:space-between;gap:16px}.eyebrow{color:var(--muted);font-size:11px;margin-bottom:3px}.current-step{font-size:18px;font-weight:620;letter-spacing:-.02em}.updated{color:var(--muted);font-size:11px;text-align:right;white-space:nowrap}#next{counter-reset:item;list-style:none;padding:0;margin:14px 0 0;border-top:1px solid var(--border)}#next li{counter-increment:item;padding:7px 0;color:var(--muted)}#next li:before{content:counter(item);display:inline-grid;place-items:center;width:18px;height:18px;margin-right:8px;border:1px solid var(--border);border-radius:5px;font:10px ui-monospace,monospace;color:var(--text)}#notes{margin-top:8px;color:var(--muted)}.queue-hint{margin:-6px 0 4px;color:var(--muted);font-size:12px}#queue{list-style:none;margin:0;padding:0;counter-reset:duty}#queue li{counter-increment:duty;display:grid;grid-template-columns:28px 4.5rem minmax(0,1fr) auto;gap:10px;align-items:center;padding:9px 0;border-top:1px solid var(--border);cursor:pointer}#queue li:first-child{border-top:0}#queue li:hover{background:var(--surface-2)}#queue li:before{content:counter(duty);display:grid;place-items:center;width:22px;height:22px;border:1px solid var(--border);border-radius:6px;font:11px ui-monospace,Consolas,monospace;color:var(--text)}#queue li.is-next:before{border-color:var(--accent);color:var(--accent)}#queue .queue-id{font-family:ui-monospace,"Cascadia Code",Consolas,monospace;color:var(--accent)}#queue .queue-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#queue .queue-tag{font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:var(--accent)}#queue li.no-prompt{cursor:default}#queue li.empty{display:block;border:0;cursor:default;counter-increment:none}#queue li.empty:before{content:none}.table-wrap{overflow:hidden}table{table-layout:fixed}th,td{padding:9px 8px;border-color:var(--border);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}th{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.06em}tbody tr:hover{background:var(--surface-2)}.mono,td:first-child,td:nth-child(6),td:nth-child(7),td:nth-child(8){font-family:ui-monospace,"Cascadia Code",Consolas,monospace}.badge{font-size:11px;padding:2px 7px}.done{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}.running{background:color-mix(in srgb,var(--run) 16%,transparent);color:var(--run)}.stalled{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}.queued{background:var(--surface-2);color:var(--muted)}.empty{color:var(--muted);padding:5px 0}.drawer-backdrop{position:fixed;inset:0;background:#0008;z-index:9}.drawer{position:fixed;z-index:10;inset:0 0 0 auto;width:min(680px,92vw);background:var(--surface);border-left:1px solid var(--border);padding:18px;display:flex;flex-direction:column;box-shadow:-16px 0 50px #0004}.drawer.hidden,.drawer-backdrop.hidden{display:none}.drawer-head{display:flex;align-items:center;gap:10px}.drawer-head h2{margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.close{margin-left:auto;border:0;background:transparent;color:var(--muted);font-size:24px;cursor:pointer}.tabs{display:flex;gap:3px;border-bottom:1px solid var(--border);margin:15px 0}.tab{border:0;background:transparent;color:var(--muted);padding:8px 10px;cursor:pointer}.tab.active{color:var(--text);box-shadow:inset 0 -2px var(--accent)}.pane{min-height:0;flex:1;overflow:auto}.pane pre{height:100%;max-height:none;background:var(--bg);border-color:var(--border);border-radius:8px}.commit{display:grid;grid-template-columns:70px minmax(0,1fr) auto;gap:10px;border-color:var(--border);padding:7px 0}.commit-subject{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.commit-age{color:var(--muted);font-size:12px}.hash{color:var(--accent)}
 html,body,main,.card,.usage-grid,.usage-cell,.orch-head,.drawer,.pane,table{max-width:100%;min-width:0}.usage-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;background:transparent;border:0;overflow:visible}.usage-cell{min-width:0;background:var(--surface-2);border-radius:8px}.usage-head{align-items:baseline;gap:10px}.usage-head span:first-child{font-size:11px;font-weight:650}.usage-head span:last-child{font-size:11px}.usage-main{display:flex;align-items:baseline;justify-content:space-between;gap:8px}.usage-pct{margin:5px 0}.usage-updated{color:var(--muted);font-size:10px;text-align:right;overflow-wrap:anywhere}.usage-track{background:color-mix(in srgb,var(--muted) 18%,transparent);border-radius:99px;overflow:hidden}.usage-fill{height:100%;border-radius:inherit}.current-step,#notes,#next li,#queue .queue-title,.commit-subject,.pane pre{overflow-wrap:anywhere}.task-title{min-width:0;overflow:hidden;text-overflow:ellipsis}.folder{max-width:40vw}
-@media(max-width:640px){body{overflow-x:hidden}main{width:100%;padding:0 16px 24px;overflow:hidden}.topbar{height:56px;min-width:0}.usage-grid{grid-template-columns:minmax(0,1fr)}.usage-cell{padding:12px}.usage-pct{font-size:21px}table,tbody{display:block;width:100%}thead{display:none}tbody tr{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;width:100%;max-width:100%;padding:10px 4px;border-bottom:1px solid var(--border);align-items:center}td{display:block;min-width:0;border:0;padding:2px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}td:before{content:none}td:nth-child(1){grid-column:1}td:nth-child(2){grid-column:2/4}.task-title{font-weight:550}td:nth-child(3){grid-column:4}td:nth-child(n+4){grid-row:2;color:var(--muted);font-size:11px}td:nth-child(4){grid-column:1}td:nth-child(5){grid-column:2}td:nth-child(6){grid-column:3}td:nth-child(7){grid-column:4}td:nth-child(8){grid-column:1 / -1;grid-row:3}td:nth-child(4):after,td:nth-child(5):after,td:nth-child(6):after{content:' ·';color:var(--muted)}.drawer{width:100%;border-left:0}.commit{grid-template-columns:58px minmax(0,1fr)}.commit-age{grid-column:2}.orch-head{display:block}.updated{text-align:left;margin-top:8px}}
+@media(max-width:640px){body{overflow-x:hidden}main{width:100%;padding:0 16px 24px;overflow:hidden}.topbar{height:56px;min-width:0}.usage-grid{grid-template-columns:minmax(0,1fr)}.usage-cell{padding:12px}.usage-pct{font-size:21px}#task-table,#task-table tbody{display:block;width:100%}#task-table thead{display:none}#task-table tbody tr{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;width:100%;max-width:100%;padding:10px 4px;border-bottom:1px solid var(--border);align-items:center}#task-table td{display:block;min-width:0;border:0;padding:2px 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}#task-table td:before{content:none}#task-table td:nth-child(1){grid-column:1}#task-table td:nth-child(2){grid-column:2/4}#task-table .task-title{font-weight:550}#task-table td:nth-child(3){grid-column:4}#task-table td:nth-child(n+4){grid-row:2;color:var(--muted);font-size:11px}#task-table td:nth-child(4){grid-column:1}#task-table td:nth-child(5){grid-column:2}#task-table td:nth-child(6){grid-column:3}#task-table td:nth-child(7){grid-column:4}#task-table td:nth-child(8){grid-column:1 / -1;grid-row:3}#task-table td:nth-child(4):after,#task-table td:nth-child(5):after,#task-table td:nth-child(6):after{content:' ·';color:var(--muted)}#session-table,#session-table tbody{display:block;width:100%}#session-table thead{display:none}#session-table tr{display:block;padding:8px 0;border-bottom:1px solid var(--border)}#session-table td{display:inline;border:0;padding:0 4px 0 0}#session-table td:nth-child(2){display:block;font-weight:550}.drawer{width:100%;border-left:0}.commit{grid-template-columns:58px minmax(0,1fr)}.commit-age{grid-column:2}.orch-head{display:block}.updated{text-align:left;margin-top:8px}}
 </style></head><body><main>
 <header class="topbar"><span class="brand">Whip-View</span><span class="folder">Whip-View</span><span id="live" class="live-dot" title="Canlı"></span></header>
 <section class="card"><h2>Kullanım</h2><div id="usage" class="usage-grid"></div></section>
 <section class="card"><h2>Claude: <span id="step">—</span></h2><div class="muted">Updated <span id="updated">—</span></div><ul id="next"></ul><div id="notes"></div></section>
 <section class="card"><h2>Sıradaki görevler</h2><p class="queue-hint">En üstteki görev önce çalışır.</p><ol id="queue"></ol></section>
-<section class="card table-wrap"><h2>Görevler</h2><table><thead><tr><th style="width:6%">ID</th><th>Başlık</th><th style="width:9%">Durum</th><th style="width:12%">Model</th><th style="width:7%">Efor</th><th style="width:7%">Token</th><th style="width:8%">Süre</th><th style="width:22%">Saat</th></tr></thead><tbody id="tasks"></tbody></table></section>
+<section class="card table-wrap"><h2>Oturumlar</h2><p class="queue-hint">Bu projede çalışan Claude ve Grok oturumları.</p><table id="session-table"><thead><tr><th style="width:10%">Kaynak</th><th>Başlık</th><th style="width:10%">Durum</th><th style="width:16%">Model</th><th style="width:8%">Efor</th><th style="width:8%">Token</th><th style="width:24%">Saat</th></tr></thead><tbody id="sessions"></tbody></table></section>
+<section class="card table-wrap"><h2>Görevler</h2><table id="task-table"><thead><tr><th style="width:6%">ID</th><th>Başlık</th><th style="width:9%">Durum</th><th style="width:12%">Model</th><th style="width:7%">Efor</th><th style="width:7%">Token</th><th style="width:8%">Süre</th><th style="width:22%">Saat</th></tr></thead><tbody id="tasks"></tbody></table></section>
 <div id="backdrop" class="drawer-backdrop hidden"></div><aside id="detail" class="drawer hidden" aria-label="Görev detayı"><div class="drawer-head"><h2 id="detail-title">Görev</h2><button id="close" class="close" aria-label="Kapat">×</button></div><div class="tabs"><button class="tab active" data-pane="prompt">Prompt</button><button class="tab" data-pane="report">Rapor</button><button class="tab" data-pane="log">Log</button></div><div class="pane"><pre id="prompt"></pre><pre id="report" class="hidden"></pre><pre id="log" class="hidden"></pre></div></aside>
 <section class="card"><h2>Recent commits</h2><div id="commits" class="muted">Loading…</div></section>
 </main><script>
@@ -415,8 +758,10 @@ function stripTaskTitle(title,id){const safe=String(id).replace(/[.*+?^${}()|[\]
 function updateUsageTimes(){document.querySelectorAll('[data-reset-at]').forEach(node=>{const at=Number(node.dataset.resetAt);node.textContent='sıfırlanma: '+(Number.isFinite(at)?duration(at-Date.now()/1000):'—')});document.querySelectorAll('[data-updated]').forEach(node=>{const at=Number(node.dataset.updated);node.textContent=Number.isFinite(at)?ago(at):''})}
 function renderUsage(data){const root=$('usage');root.replaceChildren();for(const [key,name] of [['claude','Claude'],['codex','Codex']]){const source=data[key]||{};for(const [windowKey,label] of [['five_hour','5 saat'],['weekly','Haftalık']]){const value=source[windowKey]||{},pct=value.used_percent==null?NaN:Number(value.used_percent),age=source.updated==null?Infinity:Date.now()/1000-Number(source.updated),stale=age>1800;const cell=document.createElement('div');cell.className='usage-cell'+(stale?' stale':'');const head=document.createElement('div');head.className='usage-head';head.innerHTML='<span>'+name+'</span><span>'+label+'</span>';const main=document.createElement('div');main.className='usage-main';const percent=document.createElement('div');percent.className='usage-pct';percent.textContent=Number.isFinite(pct)?pct.toFixed(1).replace('.0','')+'%':'—';const updated=document.createElement('span');updated.className='usage-updated';if(source.updated!=null)updated.dataset.updated=source.updated;main.append(percent,updated);const track=document.createElement('div');track.className='usage-track';const fill=document.createElement('div');fill.className='usage-fill'+(pct>85?' red':pct>=60?' amber':'');fill.style.width=(Number.isFinite(pct)?Math.max(0,Math.min(100,pct)):0)+'%';track.append(fill);const reset=document.createElement('div');reset.className='usage-reset';if(value.resets_at!=null)reset.dataset.resetAt=value.resets_at;else reset.textContent=value.reset?'sıfırlandı':'sıfırlanma: —';cell.append(head,main,track,reset);if(source.error||stale){const msg=document.createElement('div');msg.className='usage-message';msg.textContent=source.error||'eski veri';cell.append(msg)}root.append(cell)}}updateUsageTimes()}
 async function loadUsage(){try{renderUsage(await json('/api/usage'));$('live').classList.remove('offline')}catch(error){renderUsage({claude:{error:'Kullanım hatası: '+error.message},codex:{error:'Kullanım hatası: '+error.message}});$('live').classList.add('offline')}}
+function renderSessions(items){const body=$('sessions');body.replaceChildren();const list=Array.isArray(items)?items:[];for(const t of list){const title=t.title||'—',tr=document.createElement('tr');tr.addEventListener('click',()=>openSession(t.source,t.id,title));const values=[t.source||'—',title,t.status,t.model||'—',t.effort||'—',formatTokens(t.tokens),t.clock||'—'];values.forEach((value,i)=>{const td=document.createElement('td');if(i===1){td.className='task-title';td.title=title}if(i===6)td.title=value;if(i===2){const badge=document.createElement('span');badge.className='badge '+t.status;badge.textContent=t.status;td.append(badge)}else td.textContent=value;tr.append(td)});body.append(tr)}if(!body.children.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=7;td.className='empty';td.textContent='Bu projede başka oturum yok.';tr.append(td);body.append(tr)}}
+async function openSession(source,id,title){selected='session:'+source+':'+id;$('detail').classList.remove('hidden');$('backdrop').classList.remove('hidden');setText('detail-title',(source||'')+' — '+(title||''));try{const data=await json('/api/session/'+encodeURIComponent(String(source||'').toLowerCase())+'/'+encodeURIComponent(id));setText('prompt',data.prompt||'İstek yok.');setText('report',data.report||'Henüz özet yok.');const log=$('log'),atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<30;log.textContent=data.log||'Henüz kayıt yok.';if(atBottom||!log.dataset.loaded)log.scrollTop=log.scrollHeight;log.dataset.loaded='1'}catch(error){setText('log','Bağlantı hatası: '+error.message)}}
 function renderQueue(items){const root=$('queue');root.replaceChildren();const list=Array.isArray(items)?items:[];if(!list.length){const li=document.createElement('li');li.className='empty';li.textContent='Sırada görev yok.';root.append(li);return}list.forEach((item,index)=>{const li=document.createElement('li');if(index===0)li.classList.add('is-next');if(item.prompt===false)li.classList.add('no-prompt');const id=document.createElement('span');id.className='queue-id';id.textContent=item.id||'—';const title=document.createElement('span');title.className='queue-title';const text=item.id?stripTaskTitle(item.title,item.id):(item.title||'');title.textContent=text||'—';title.title=text||'';li.append(id,title);if(index===0){const tag=document.createElement('span');tag.className='queue-tag';tag.textContent='ilk';li.append(tag)}if(item.prompt!==false&&item.id)li.addEventListener('click',()=>openTask(item.id,text));root.append(li)})}
-function renderState(data){const o=data.orchestrator||{};setText('step',o.claude_step||'—');setText('updated',fmtTime(o.updated));setText('notes',o.notes||'');renderQueue(data.queue);const body=$('tasks');body.replaceChildren();for(const t of data.tasks||[]){const title=stripTaskTitle(t.title,t.id),tr=document.createElement('tr');tr.addEventListener('click',()=>openTask(t.id,title));const values=[t.id,title,t.status,t.model||'—',t.effort||'—',formatTokens(t.tokens),trDuration(t.elapsed),t.clock||'—'];values.forEach((value,i)=>{const td=document.createElement('td');td.dataset.label=labels[i];if(i===1){td.className='task-title';td.title=title}if(i===7)td.title=value;if(i===2){const badge=document.createElement('span');badge.className='badge '+t.status;badge.textContent=t.status;td.append(badge)}else td.textContent=value;tr.append(td)});body.append(tr)}if(!body.children.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=8;td.className='empty';td.textContent='Henüz görev yok.';tr.append(td);body.append(tr)}const commits=$('commits');commits.replaceChildren();if(!(data.commits||[]).length){commits.className='empty';commits.textContent='Git geçmişi bulunamadı.'}for(const c of data.commits||[]){const div=document.createElement('div');div.className='commit';const hash=document.createElement('span');hash.className='hash mono';hash.textContent=c.hash;const subject=document.createElement('span');subject.className='commit-subject';subject.textContent=c.subject;const age=document.createElement('span');age.className='commit-age';age.textContent=c.age;div.append(hash,subject,age);commits.append(div)}}
+function renderState(data){const o=data.orchestrator||{};setText('step',o.claude_step||'—');setText('updated',fmtTime(o.updated));setText('notes',o.notes||'');renderQueue(data.queue);renderSessions(data.sessions);const body=$('tasks');body.replaceChildren();for(const t of data.tasks||[]){const title=stripTaskTitle(t.title,t.id),tr=document.createElement('tr');tr.addEventListener('click',()=>openTask(t.id,title));const values=[t.id,title,t.status,t.model||'—',t.effort||'—',formatTokens(t.tokens),trDuration(t.elapsed),t.clock||'—'];values.forEach((value,i)=>{const td=document.createElement('td');td.dataset.label=labels[i];if(i===1){td.className='task-title';td.title=title}if(i===7)td.title=value;if(i===2){const badge=document.createElement('span');badge.className='badge '+t.status;badge.textContent=t.status;td.append(badge)}else td.textContent=value;tr.append(td)});body.append(tr)}if(!body.children.length){const tr=document.createElement('tr'),td=document.createElement('td');td.colSpan=8;td.className='empty';td.textContent='Henüz görev yok.';tr.append(td);body.append(tr)}const commits=$('commits');commits.replaceChildren();if(!(data.commits||[]).length){commits.className='empty';commits.textContent='Git geçmişi bulunamadı.'}for(const c of data.commits||[]){const div=document.createElement('div');div.className='commit';const hash=document.createElement('span');hash.className='hash mono';hash.textContent=c.hash;const subject=document.createElement('span');subject.className='commit-subject';subject.textContent=c.subject;const age=document.createElement('span');age.className='commit-age';age.textContent=c.age;div.append(hash,subject,age);commits.append(div)}}
 async function loadState(){try{const data=await json('/api/state'),signature=JSON.stringify(data);$('live').classList.remove('offline');if(signature!==stateSignature){stateSignature=signature;renderState(data)}}catch(error){$('live').classList.add('offline');setText('step','Bağlantı hatası: '+error.message)}}
 async function openTask(id,title){selected=id;$('detail').classList.remove('hidden');$('backdrop').classList.remove('hidden');setText('detail-title',id+' — '+(title||''));try{const data=await json('/api/task/'+encodeURIComponent(id));setText('prompt',data.prompt||'İçerik yok.');setText('report',data.report||'Henüz rapor yok.');const log=$('log'),atBottom=log.scrollHeight-log.scrollTop-log.clientHeight<30;log.textContent=data.log||'Henüz log yok.';if(atBottom||!log.dataset.loaded)log.scrollTop=log.scrollHeight;log.dataset.loaded='1'}catch(error){setText('log','Bağlantı hatası: '+error.message)}}
 const closeDrawer=()=>{selected=null;$('detail').classList.add('hidden');$('backdrop').classList.add('hidden')};
@@ -424,7 +769,7 @@ $('close').onclick=closeDrawer;$('backdrop').onclick=closeDrawer;document.addEve
 loadUsage();loadState();
 setInterval(loadUsage,10000);
 setInterval(loadState,3000);
-setInterval(()=>{if(selected)openTask(selected,$('detail-title').textContent.replace(/^.*? — /,''))},3000);
+setInterval(()=>{if(!selected)return;if(String(selected).startsWith('session:')){const parts=String(selected).split(':');openSession(parts[1],parts.slice(2).join(':'),$('detail-title').textContent.replace(/^.*? — /,''));return}openTask(selected,$('detail-title').textContent.replace(/^.*? — /,''))},3000);
 setInterval(updateUsageTimes,1000);
 </script></body></html>'''
 
@@ -463,11 +808,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "orchestrator": orchestrator,
                     "tasks": tasks,
                     "queue": queue,
+                    "sessions": session_state(),
                     "commits": git_commits(),
                 }
             )
         elif path == "/api/usage":
             self.send_json(usage_state())
+        elif path.startswith("/api/session/"):
+            parts = [unquote(part) for part in path[len("/api/session/") :].split("/", 1)]
+            detail = session_detail(parts[0], parts[1]) if len(parts) == 2 else None
+            if detail is None:
+                self.send_json({"error": "Session not found"}, 404)
+            else:
+                self.send_json(detail)
         elif path.startswith("/api/task/"):
             task_id = unquote(path[len("/api/task/") :])
             detail = task_detail(task_id)
