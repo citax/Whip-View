@@ -33,8 +33,11 @@ Direct: `python whipview.py <project-root> [options]`.
 Status per task: `done` (report exists) · `running` (log updated < 10 min ago) ·
 `stalled` · `queued` (prompt only).
 
-The page shows the orchestrator's current step, all tasks with model / effort /
-tokens / elapsed / start–end clock, a live log tail per task, and the last git commits.
+The page shows the orchestrator's current step, the queued duties in run order,
+all tasks with model / effort / tokens / elapsed / start–end clock, a live log
+tail per task, and the last git commits. Run order is the `next` list in
+`status.json` (the first entry runs first). Queued prompts missing from that
+list follow afterwards, oldest prompt first.
 The clock is the log file's creation time through the report's finish time
 (`21.09.2026 14:59–15:14`). A run that crosses midnight repeats the date on the
 end (`21.09.2026 23:50–22.09.2026 00:18`). A run that is still open shows the
